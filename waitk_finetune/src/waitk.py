@@ -144,6 +144,27 @@ def average_lagging(trace, num_src_words: int) -> float:
     return sum(g[t] - t / rate for t in range(tau)) / tau
 
 
+def laal(trace, num_src_words: int) -> float:
+    """Length-Adaptive Average Lagging — unbiased for over/under-generation.
+
+    Standard AL underestimates latency when the system over-generates.
+    LAAL normalises by max(|target|, |source|) instead of tau.
+    """
+    src_read, g = 0, []
+    for action, _ in trace:
+        if action == "READ":
+            src_read += 1
+        elif action == "WRITE":
+            g.append(src_read)
+    if not g:
+        return float("nan")
+    tgt_len, src_len = len(g), num_src_words
+    rate = tgt_len / src_len if src_len > 0 else 1.0
+    tau_cutoff = next((i + 1 for i, gv in enumerate(g) if gv >= src_len), tgt_len)
+    denominator = max(tgt_len, src_len)
+    return sum(g[t] - t / rate for t in range(tau_cutoff)) / denominator
+
+
 def load_pairs(path: str):
     """Load an IN22-style json: returns (sources, references)."""
     with open(path, encoding="utf-8") as f:

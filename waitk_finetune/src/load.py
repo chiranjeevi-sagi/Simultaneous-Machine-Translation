@@ -1,4 +1,7 @@
-"""Load a (base or LoRA-fine-tuned) model for evaluation / inference."""
+"""Load a (base or LoRA-fine-tuned) model for evaluation / inference.
+
+Supports 4-bit quantization via bitsandbytes for low-VRAM GPUs (e.g. 6GB).
+"""
 from __future__ import annotations
 
 import torch
@@ -6,7 +9,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def load_model(base_name: str, adapter_path: str | None = None,
-               dtype: str = "bfloat16", device: str | None = None):
+               dtype: str = "bfloat16", device: str | None = None,
+               quantize_4bit: bool = False):
+    """Load the model for inference.
+
+    Args:
+        quantize_4bit: If True, load in 4-bit via bitsandbytes (fits in ~3GB VRAM).
+                       Requires: pip install bitsandbytes
+    """
     device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     torch_dtype = getattr(torch, dtype)
 
@@ -16,17 +26,37 @@ def load_model(base_name: str, adapter_path: str | None = None,
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    model = AutoModelForCausalLM.from_pretrained(
-        base_name, dtype=torch_dtype, attn_implementation="eager"
-    )
+    if quantize_4bit:
+        from transformers import BitsAndBytesConfig
+
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch_dtype,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            base_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            attn_implementation="eager",
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_name, dtype=torch_dtype, attn_implementation="eager"
+        )
+
     if adapter_path:
         from peft import PeftModel
 
         model = PeftModel.from_pretrained(model, adapter_path)
-        model = model.merge_and_unload()   # fold LoRA into base for fast inference
+        if not quantize_4bit:
+            model = model.merge_and_unload()   # fold LoRA into base for fast inference
 
     model.config.use_cache = True
-    model.to(device).eval()
+    if not quantize_4bit:
+        model.to(device)
+    model.eval()
     return model, tokenizer
 
 
