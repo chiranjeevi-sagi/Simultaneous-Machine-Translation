@@ -6,7 +6,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def load_model(base_name: str, adapter_path: str | None = None,
-               dtype: str = "bfloat16", device: str | None = None):
+               dtype: str = "bfloat16", device: str | None = None,
+               quantize_4bit: bool = False):
     device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     torch_dtype = getattr(torch, dtype)
 
@@ -16,17 +17,37 @@ def load_model(base_name: str, adapter_path: str | None = None,
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    model = AutoModelForCausalLM.from_pretrained(
-        base_name, dtype=torch_dtype, attn_implementation="eager"
-    )
+    if quantize_4bit and "cuda" in device:
+        from transformers import BitsAndBytesConfig
+        q_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch_dtype,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+        print(f"[load] Loading '{base_name}' in 4-bit quantization...")
+        model = AutoModelForCausalLM.from_pretrained(
+            base_name,
+            quantization_config=q_cfg,
+            device_map="auto",
+            attn_implementation="eager",
+        )
+    else:
+        print(f"[load] Loading '{base_name}' in {dtype} precision...")
+        model = AutoModelForCausalLM.from_pretrained(
+            base_name, torch_dtype=torch_dtype, attn_implementation="eager"
+        )
+        model.to(device)
+
     if adapter_path:
         from peft import PeftModel
-
+        print(f"[load] Loading adapter from '{adapter_path}'...")
         model = PeftModel.from_pretrained(model, adapter_path)
-        model = model.merge_and_unload()   # fold LoRA into base for fast inference
+        if not quantize_4bit:
+            model = model.merge_and_unload()   # fold LoRA into base for fast inference
 
     model.config.use_cache = True
-    model.to(device).eval()
+    model.eval()
     return model, tokenizer
 
 

@@ -85,9 +85,10 @@ def wait_k_decode(
             trace.append(("READ", src_words[prev_read - 1]))
 
         prompt = build_prompt(tokenizer, " ".join(src_words[:num_src]), target_language)
-        prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+        first_device = next(model.parameters()).device
+        prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(first_device)
         if committed:
-            tail = torch.tensor([committed], device=model.device, dtype=prompt_ids.dtype)
+            tail = torch.tensor([committed], device=first_device, dtype=prompt_ids.dtype)
             input_ids = torch.cat([prompt_ids, tail], dim=1)
         else:
             input_ids = prompt_ids

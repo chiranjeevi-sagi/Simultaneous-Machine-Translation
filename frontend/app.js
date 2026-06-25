@@ -193,9 +193,14 @@ async function translateFull() {
 }
 
 // --- Translation: Streaming Wait-K ---
-async function translateStream() {
+let _eventSource = null;
+
+function translateStream() {
     const text = document.getElementById('source-input').value.trim();
     if (!text || state.isTranslating) return;
+
+    // Close any previous stream
+    if (_eventSource) { _eventSource.close(); _eventSource = null; }
 
     state.isTranslating = true;
     setStatus(`Translating (wait-${state.k})...`, 'streaming');
@@ -206,127 +211,44 @@ async function translateStream() {
 
     outputEl.innerHTML = '<span class="cursor-blink"></span>';
     traceEl.innerHTML = '';
+    statsEl.textContent = '';
 
-    let readCount = 0;
-    let writeCount = 0;
-    let translationText = '';
+    let readCount = 0, writeCount = 0;
 
-    try {
-        const res = await fetch('/api/translate/stream', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, target_lang: state.tgtLang, k: state.k }),
-        });
+    const params = new URLSearchParams({ text, target_lang: state.tgtLang, k: state.k });
+    _eventSource = new EventSource(`/api/translate/stream?${params}`);
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop();
-
-            for (const line of lines) {
-                if (line.startsWith('event: ')) {
-                    const eventType = line.slice(7).trim();
-                    continue;
-                }
-                if (line.startsWith('data: ')) {
-                    const rawData = line.slice(6);
-                    let eventType = 'message';
-
-                    // Find the event type from buffer context
-                    const prevLines = lines.slice(0, lines.indexOf(line));
-                    for (let i = prevLines.length - 1; i >= 0; i--) {
-                        if (prevLines[i].startsWith('event: ')) {
-                            eventType = prevLines[i].slice(7).trim();
-                            break;
-                        }
-                    }
-
-                    try {
-                        const data = JSON.parse(rawData);
-                        handleStreamEvent(eventType, data, outputEl, traceEl, statsEl);
-
-                        if (eventType === 'read') readCount++;
-                        if (eventType === 'write') writeCount++;
-
-                        statsEl.textContent = `READ: ${readCount} | WRITE: ${writeCount}`;
-                    } catch (e) {
-                        // Skip malformed data
-                    }
-                }
-            }
-        }
-    } catch (e) {
-        // Try alternative SSE approach
-        try {
-            await translateStreamSSE(text, outputEl, traceEl, statsEl);
-        } catch (e2) {
-            outputEl.textContent = `Error: ${e2.message}`;
-            setStatus('Error', '');
-        }
-    }
-
-    state.isTranslating = false;
-}
-
-async function translateStreamSSE(text, outputEl, traceEl, statsEl) {
-    return new Promise((resolve, reject) => {
-        // Use EventSource via POST workaround
-        const url = `/api/translate/stream`;
-        const body = JSON.stringify({ text, target_lang: state.tgtLang, k: state.k });
-
-        fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: body,
-        }).then(async response => {
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-            let currentEvent = 'message';
-            let readCount = 0, writeCount = 0;
-
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                const parts = buffer.split('\n\n');
-                buffer = parts.pop();
-
-                for (const part of parts) {
-                    const lines = part.split('\n');
-                    let event = 'message';
-                    let data = '';
-
-                    for (const line of lines) {
-                        if (line.startsWith('event:')) {
-                            event = line.slice(6).trim();
-                        } else if (line.startsWith('data:')) {
-                            data = line.slice(5).trim();
-                        }
-                    }
-
-                    if (data) {
-                        try {
-                            const parsed = JSON.parse(data);
-                            handleStreamEvent(event, parsed, outputEl, traceEl, statsEl);
-                            if (event === 'read') readCount++;
-                            if (event === 'write') writeCount++;
-                            statsEl.textContent = `READ: ${readCount} | WRITE: ${writeCount}`;
-                        } catch (e) { /* skip */ }
-                    }
-                }
-            }
-            resolve();
-        }).catch(reject);
+    _eventSource.addEventListener('read', (e) => {
+        const data = JSON.parse(e.data);
+        handleStreamEvent('read', data, outputEl, traceEl, statsEl);
+        readCount++;
+        statsEl.textContent = `READ: ${readCount} | WRITE: ${writeCount}`;
     });
+
+    _eventSource.addEventListener('write', (e) => {
+        const data = JSON.parse(e.data);
+        handleStreamEvent('write', data, outputEl, traceEl, statsEl);
+        writeCount++;
+        statsEl.textContent = `READ: ${readCount} | WRITE: ${writeCount}`;
+    });
+
+    _eventSource.addEventListener('stop', (e) => {
+        handleStreamEvent('stop', {}, outputEl, traceEl, statsEl);
+    });
+
+    _eventSource.addEventListener('done', (e) => {
+        const data = JSON.parse(e.data);
+        handleStreamEvent('done', data, outputEl, traceEl, statsEl);
+        _eventSource.close(); _eventSource = null;
+        state.isTranslating = false;
+    });
+
+    _eventSource.onerror = () => {
+        outputEl.textContent = 'Error: could not stream translation. Check server logs.';
+        setStatus('Error', '');
+        _eventSource.close(); _eventSource = null;
+        state.isTranslating = false;
+    };
 }
 
 function handleStreamEvent(event, data, outputEl, traceEl, statsEl) {
@@ -384,35 +306,42 @@ async function runComparison() {
 
     fullEl.innerHTML = '<span class="loading-shimmer" style="display:inline-block;width:80%;height:1.2em;border-radius:4px;">&nbsp;</span>';
     waitkEl.innerHTML = '<span class="loading-shimmer" style="display:inline-block;width:80%;height:1.2em;border-radius:4px;">&nbsp;</span>';
-    fullStatus.innerHTML = '<span class="status-dot"></span><span>Translating...</span>';
+    fullStatus.innerHTML = '<span class="status-dot"></span><span>Running both policies...</span>';
     fullStatus.className = 'status-bar streaming';
-    waitkStatus.innerHTML = '<span class="status-dot"></span><span>Translating...</span>';
+    waitkStatus.innerHTML = '<span class="status-dot"></span><span>Running both policies...</span>';
     waitkStatus.className = 'status-bar streaming';
 
-    // Run both in parallel
-    const [fullRes, waitkRes] = await Promise.allSettled([
-        fetch('/api/translate', {
+    try {
+        const res = await fetch('/api/translate/compare', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, target_lang: state.tgtLang }),
-        }).then(r => r.json()),
-        fetch('/api/translate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, target_lang: state.tgtLang }),
-        }).then(r => r.json()),
-    ]);
+            body: JSON.stringify({ text, target_lang: state.tgtLang, k: state.k }),
+        });
+        const data = await res.json();
 
-    if (fullRes.status === 'fulfilled') {
-        fullEl.textContent = fullRes.value.translation;
+        // Full-sentence result
+        fullEl.textContent = data.full_translation;
         fullStatus.innerHTML = '<span class="status-dot"></span><span>Complete (reads all → translates)</span>';
         fullStatus.className = 'status-bar active';
-    }
 
-    if (waitkRes.status === 'fulfilled') {
-        waitkEl.textContent = waitkRes.value.translation;
-        waitkStatus.innerHTML = `<span class="status-dot"></span><span>Complete (wait-${state.k}: starts after ${state.k} words)</span>`;
+        // Wait-K result with metrics
+        const m = data.metrics;
+        waitkEl.innerHTML = `
+            <div style="margin-bottom:12px">${escapeHtml(data.waitk_translation)}</div>
+            <div style="padding:12px; background:rgba(0,0,0,0.25); border-radius:8px; border:1px solid var(--border-glass)">
+                <div style="font-size:0.75rem; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:6px">Latency Metrics</div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:0.9rem">
+                    <div>Average Lagging (AL):<br><strong style="color:var(--accent-primary); font-size:1.1rem">${m.al !== null ? m.al + ' words' : 'N/A'}</strong></div>
+                    <div>Length-Adaptive AL:<br><strong style="color:var(--accent-primary); font-size:1.1rem">${m.laal !== null ? m.laal + ' words' : 'N/A'}</strong></div>
+                </div>
+            </div>
+        `;
+        waitkStatus.innerHTML = `<span class="status-dot"></span><span>Complete (Wait-${m.k}, ${m.src_words} source words)</span>`;
         waitkStatus.className = 'status-bar active';
+    } catch (e) {
+        fullEl.textContent = `Error: ${e.message}`;
+        waitkEl.textContent = `Error: ${e.message}`;
+        fullStatus.className = waitkStatus.className = 'status-bar';
     }
 
     state.isTranslating = false;
