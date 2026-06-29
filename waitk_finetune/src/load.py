@@ -32,7 +32,14 @@ def load_model(base_name: str, adapter_path: str | None = None,
             print(f"[load] Loading '{base_name}' in 4-bit (attn={attn})...")
             return AutoModelForCausalLM.from_pretrained(
                 base_name, quantization_config=q_cfg,
-                device_map="auto", attn_implementation=attn,
+                # Pin the whole model to one GPU. device_map="auto" silently
+                # offloads to CPU/disk when VRAM is tight; bitsandbytes
+                # double-quant + offload then crashes in dispatch_model with
+                # "Tensor.item() cannot be called on meta tensors". A single
+                # device skips that hook path and fails with a clear OOM if the
+                # model truly doesn't fit (CPU-offloaded generation is too slow
+                # for simultaneous translation anyway).
+                device_map={"": device}, attn_implementation=attn,
                 # Gemma must run in bf16 — the non-quantized layers default to
                 # float16, which overflows and produces all-special-token garbage.
                 torch_dtype=torch_dtype,
